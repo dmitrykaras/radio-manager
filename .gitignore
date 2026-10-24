@@ -1,0 +1,24 @@
+# Тяжелые архивы и папки с радиоэфирами
+/radio/
+/radio_archives/
+*.mp3
+*.wav
+
+
+# === C# / .NET ===
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Настройки IDE и редакторов
+.idea/
+.vscode/
+*.iml
+*.suo
+.DS_Store
+Thumbs.db
