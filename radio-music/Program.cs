@@ -1,8 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
-using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 class Program
@@ -14,94 +15,244 @@ class Program
         { "Russkiy_Rok", "https://ru.volna.top/pls/downloadrusrock.php?file={0:D2}" }
     };
 
-    private static readonly string OutputDir = @"D:\radio-music\radio";
-    private static readonly HttpClient Client = new()
+    private const string OutputDir = @"D:\git\radio-music\radio";
+    private const string LogPath = @"D:\git\radio-music\log.txt";
+
+    private const int HoursBack = 23; // сколько последних завершённых часов качать
+    private const int KeepDays = 3; // хранить папки за N последних дней
+    private const int MaxAttempts = 3; // попыток на один файл
+    private const int MaxParallel = 4; // одновременных загрузок
+    private const long MinValidSize = 1_000_000; // 1 МБ; подберите под реальный размер часа
+    private const bool CheckMp3Header = true; // поставьте false, если нормальные файлы считаются битыми
+
+    private static readonly TimeZoneInfo ServerTz = GetServerTz();
+    private static readonly SemaphoreSlim Limiter = new(MaxParallel);
+    private static readonly HttpClient Client = CreateClient();
+    private static readonly object LogLock = new();
+
+    private static int _downloaded, _skipped, _failed;
+
+    static async Task<int> Main()
     {
-        DefaultRequestHeaders = { { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-    };
+        Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+        Directory.CreateDirectory(OutputDir);
 
-    static async Task Main(string[] args)
-    {
-        Console.WriteLine("[Запуск параллельного скачивания радио...]");
-        await DownloadCurrentDayAsync();
+        var now = TimeZoneInfo.ConvertTime(DateTimeOffset.Now, ServerTz).DateTime;
+        Log($"Запуск. Время сервера: {now:yyyy-MM-dd HH:mm}");
 
-        CleanOldFiles();
+        DeleteTmpFiles();
+        await DownloadAllAsync(now);
+        CleanOldFolders(now);
 
-        Console.WriteLine("\nВсе задачи успешно выполнены!");
+        Log($"Итог: скачано {_downloaded}, уже было {_skipped}, ошибок {_failed}");
+        return _failed == 0 ? 0 : 1;
     }
 
-    private static async Task DownloadCurrentDayAsync()
+    private static async Task DownloadAllAsync(DateTime now)
     {
-        Directory.CreateDirectory(OutputDir);
-        string todayStr = DateTime.Now.ToString("yyyy-MM-dd");
-
-        var downloadTasks = new List<Task>();
+        var tasks = new List<Task>();
 
         foreach (var station in Stations)
         {
-            string dayDir = Path.Combine(OutputDir, station.Key, todayStr);
-            Directory.CreateDirectory(dayDir);
-
-            for (int hour = 0; hour < 24; hour++)
+            for (int back = 1; back <= HoursBack; back++)
             {
-                int h = hour;
-                string hourStr = h.ToString("D2");
+                var slot = now.AddHours(-back);
+                string dateStr = slot.ToString("yyyy-MM-dd");
+                string hourStr = slot.Hour.ToString("D2");
+                string label = $"[{station.Key}] {dateStr} {hourStr}:00";
+
+                string dayDir = Path.Combine(OutputDir, station.Key, dateStr);
+                Directory.CreateDirectory(dayDir);
                 string filePath = Path.Combine(dayDir, $"{hourStr}-00.mp3");
 
-                // Если файл уже есть — пропускаем
-                if (File.Exists(filePath) && new FileInfo(filePath).Length > 0)
-                    continue;
+                if (File.Exists(filePath))
+                {
+                    if (IsValidMp3(filePath, out string reason))
+                    {
+                        Interlocked.Increment(ref _skipped);
+                        continue;
+                    }
 
-                string url = string.Format(station.Value, h);
-                downloadTasks.Add(DownloadHourAsync(url, filePath, station.Key, hourStr));
+                    Log($"  [~] {label} файл повреждён ({reason}), перекачиваю");
+                    try { File.Delete(filePath); } catch (Exception ex) { Log($"  [x] {label} не удалось удалить: {ex.Message}"); continue; }
+                }
+
+                string url = string.Format(station.Value, slot.Hour);
+                tasks.Add(DownloadWithRetriesAsync(url, filePath, label));
             }
         }
 
-        // Ждем завершения всех загрузок одновременно
-        await Task.WhenAll(downloadTasks);
+        Log($"Задач на скачивание: {tasks.Count}");
+        await Task.WhenAll(tasks);
     }
 
-    private static async Task DownloadHourAsync(string url, string filePath, string stationName, string hourStr)
+    private static async Task DownloadWithRetriesAsync(string url, string filePath, string label)
     {
+        await Limiter.WaitAsync();
         try
         {
-            using var response = await Client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-            if (response.IsSuccessStatusCode)
+            for (int attempt = 1; attempt <= MaxAttempts; attempt++)
             {
-                await using var contentStream = await response.Content.ReadAsStreamAsync();
-                await using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, useAsync: true);
-                await contentStream.CopyToAsync(fileStream);
-                Console.WriteLine($"  [+] [{stationName}] Скачан час {hourStr}:00");
+                string tmpPath = filePath + ".tmp";
+                try
+                {
+                    using var response = await Client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Log($"  [!] {label} HTTP {(int)response.StatusCode} (попытка {attempt}/{MaxAttempts})");
+                        if ((int)response.StatusCode == 404) break; // повторять смысла нет
+                        await Task.Delay(TimeSpan.FromSeconds(5 * attempt));
+                        continue;
+                    }
+
+                    long? expected = response.Content.Headers.ContentLength;
+
+                    await using (var src = await response.Content.ReadAsStreamAsync())
+                    await using (var dst = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+                    {
+                        await src.CopyToAsync(dst);
+                    }
+
+                    long actual = new FileInfo(tmpPath).Length;
+
+                    if (expected.HasValue && actual != expected.Value)
+                    {
+                        Log($"  [!] {label} получено {actual} из {expected} байт (попытка {attempt}/{MaxAttempts})");
+                        File.Delete(tmpPath);
+                        continue;
+                    }
+
+                    if (!IsValidMp3(tmpPath, out string reason))
+                    {
+                        Log($"  [!] {label} невалидный файл: {reason} (попытка {attempt}/{MaxAttempts})");
+                        File.Delete(tmpPath);
+                        await Task.Delay(TimeSpan.FromSeconds(5 * attempt));
+                        continue;
+                    }
+
+                    File.Move(tmpPath, filePath, overwrite: true);
+                    Interlocked.Increment(ref _downloaded);
+                    Log($"  [+] {label} скачан ({actual / 1024 / 1024} МБ)");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log($"  [x] {label} {ex.GetType().Name}: {ex.Message} (попытка {attempt}/{MaxAttempts})");
+                    try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                    await Task.Delay(TimeSpan.FromSeconds(5 * attempt));
+                }
             }
+
+            Interlocked.Increment(ref _failed);
+            Log($"  [FAIL] {label} не удалось скачать");
         }
-        catch
+        finally
         {
-            // Пропускаем недоступные часы
+            Limiter.Release();
         }
     }
 
-    private static void CleanOldFiles()
+    private static bool IsValidMp3(string path, out string reason)
     {
-        Console.WriteLine("\n[Очистка старых архивов...]");
-        if (!Directory.Exists(OutputDir)) return;
-
-        var cutoff = DateTime.Now.AddDays(-3);
-
-        foreach (var file in Directory.GetFiles(OutputDir, "*.*", SearchOption.AllDirectories))
+        reason = "";
+        try
         {
-            try
+            var info = new FileInfo(path);
+            if (info.Length < MinValidSize)
             {
-                var fileInfo = new FileInfo(file);
-                if (fileInfo.LastWriteTime < cutoff)
+                reason = $"размер {info.Length} байт";
+                return false;
+            }
+
+            if (CheckMp3Header)
+            {
+                var buf = new byte[3];
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (fs.Read(buf, 0, 3) < 3)
                 {
-                    fileInfo.Delete();
-                    Console.WriteLine($"  [-] Удален устаревший файл: {fileInfo.Name}");
+                    reason = "не читается заголовок";
+                    return false;
+                }
+
+                bool id3 = buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3';
+                bool sync = buf[0] == 0xFF && (buf[1] & 0xE0) == 0xE0;
+                if (!id3 && !sync)
+                {
+                    reason = "нет заголовка mp3 (возможно, HTML)";
+                    return false;
                 }
             }
-            catch
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = ex.Message;
+            return false;
+        }
+    }
+
+    private static void DeleteTmpFiles()
+    {
+        foreach (var tmp in Directory.GetFiles(OutputDir, "*.tmp", SearchOption.AllDirectories))
+        {
+            try { File.Delete(tmp); Log($"  [-] Удалён хвост: {tmp}"); } catch { }
+        }
+    }
+
+    private static void CleanOldFolders(DateTime now)
+    {
+        Log("[Очистка старых записей...]");
+        var cutoff = now.Date.AddDays(-KeepDays);
+
+        foreach (var stationDir in Directory.GetDirectories(OutputDir))
+        {
+            foreach (var dayDir in Directory.GetDirectories(stationDir))
             {
-                // Игнорируем ошибки доступа к файлам
+                string name = Path.GetFileName(dayDir);
+                if (!DateTime.TryParseExact(name, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                                            DateTimeStyles.None, out var date))
+                    continue;
+
+                if (date < cutoff)
+                {
+                    try
+                    {
+                        Directory.Delete(dayDir, recursive: true);
+                        Log($"  [-] Удалено: {Path.GetFileName(stationDir)}\\{name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"  [x] Не удалось удалить {dayDir}: {ex.Message}");
+                    }
+                }
             }
         }
+    }
+
+    private static void Log(string message)
+    {
+        string line = $"{DateTime.Now:HH:mm:ss} {message}";
+        lock (LogLock)
+        {
+            Console.WriteLine(line);
+            try { File.AppendAllText(LogPath, line + Environment.NewLine); } catch { }
+        }
+    }
+
+    private static HttpClient CreateClient()
+    {
+        var c = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+        c.DefaultRequestHeaders.Referrer = new Uri("https://ru.volna.top/");
+        return c;
+    }
+
+    private static TimeZoneInfo GetServerTz()
+    {
+        try { return TimeZoneInfo.FindSystemTimeZoneById("Russian Standard Time"); } // Windows
+        catch { }
+        try { return TimeZoneInfo.FindSystemTimeZoneById("Europe/Moscow"); } // Linux/macOS
+        catch { return TimeZoneInfo.Local; }
     }
 }
